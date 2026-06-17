@@ -1,9 +1,16 @@
 [package]
-name = "khufia"
+name = "specter"
 version = "0.1.0"
 description = "A basic, screenshot-protected internet browser built with Tauri"
 edition = "2021"
 rust-version = "1.77.2"
+
+# Capitalize the binary so the macOS app-menu name reads "Specter" in dev too
+# (the crate name stays lowercase per convention; `tauri build` already names
+# the bundle from productName).
+[[bin]]
+name = "Specter"
+path = "src/main.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
