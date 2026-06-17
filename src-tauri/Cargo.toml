@@ -1,0 +1,22 @@
+[package]
+name = "khufia"
+version = "0.1.0"
+description = "A basic, screenshot-protected internet browser built with Tauri"
+edition = "2021"
+rust-version = "1.77.2"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# `unstable` is required for multiple webviews inside a single window
+# (Window::add_child, Manager::get_webview).
+tauri = { version = "2", features = ["unstable"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

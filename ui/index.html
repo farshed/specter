@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Specter toolbar</title>
+    <style>
+      :root {
+        --bg: #1d1f23;
+        --field: #2b2e34;
+        --field-focus: #34373f;
+        --tab: #26282d;
+        --tab-active: #34373f;
+        --text: #e8eaed;
+        --muted: #9aa0a6;
+        --accent: #6aa3ff;
+        --border: #3a3d44;
+      }
+      * { box-sizing: border-box; }
+      html, body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+        background: var(--bg);
+        color: var(--text);
+        user-select: none;
+      }
+      .chrome {
+        display: flex;
+        flex-direction: column;
+        height: 100%;
+      }
+
+      /* ---- Tab strip ---- */
+      .tabs {
+        flex: 0 0 auto;
+        height: 38px;
+        display: flex;
+        align-items: flex-end;
+        gap: 4px;
+        padding: 6px 8px 0;
+        overflow-x: auto;
+        overflow-y: hidden;
+        scrollbar-width: none;
+      }
+      .tabs::-webkit-scrollbar { display: none; }
+      .tab {
+        flex: 0 1 200px;
+        min-width: 70px;
+        height: 32px;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 0 6px 0 12px;
+        border-radius: 9px 9px 0 0;
+        background: var(--tab);
+        color: var(--muted);
+        font-size: 12px;
+        cursor: default;
+        white-space: nowrap;
+        overflow: hidden;
+      }
+      .tab.active { background: var(--tab-active); color: var(--text); }
+      .tab:hover:not(.active) { background: #2e3137; }
+      .tab .label {
+        flex: 1;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .tab .close {
+        all: unset;
+        flex: 0 0 auto;
+        width: 18px;
+        height: 18px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: 5px;
+        font-size: 14px;
+        color: var(--muted);
+        cursor: pointer;
+      }
+      .tab .close:hover { background: rgba(255, 255, 255, 0.14); color: var(--text); }
+      .newtab {
+        all: unset;
+        flex: 0 0 auto;
+        width: 28px;
+        height: 28px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: 7px;
+        color: var(--muted);
+        font-size: 18px;
+        cursor: pointer;
+      }
+      .newtab:hover { background: var(--field); color: var(--text); }
+
+      /* ---- Nav row ---- */
+      .bar {
+        flex: 1 1 auto;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 0 10px;
+      }
+      button.nav {
+        all: unset;
+        width: 32px;
+        height: 32px;
+        flex: 0 0 auto;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: 8px;
+        color: var(--muted);
+        cursor: pointer;
+        font-size: 16px;
+        line-height: 1;
+        transition: background 0.12s ease, color 0.12s ease;
+      }
+      button.nav:hover { background: var(--field); color: var(--text); }
+      button.nav:active { background: var(--field-focus); }
+      form {
+        flex: 1 1 auto;
+        min-width: 0;
+        display: flex;
+      }
+      input {
+        flex: 1;
+        min-width: 0;
+        height: 34px;
+        line-height: normal;
+        padding: 0 18px;
+        border: 1px solid var(--border);
+        border-radius: 999px;
+        background: var(--field);
+        color: var(--text);
+        font-size: 14px;
+        outline: none;
+        user-select: text;
+        transition: border-color 0.12s ease, background 0.12s ease;
+      }
+      input:focus {
+        border-color: var(--accent);
+        background: var(--field-focus);
+      }
+      input::placeholder { color: var(--muted); }
+      .shield {
+        flex: 0 0 auto;
+        margin-left: 2px;
+        width: 32px;
+        height: 32px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: 8px;
+        color: #38c172;
+        cursor: default;
+      }
+      .shield .dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: #38c172;
+        box-shadow: 0 0 6px #38c172aa;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="chrome">
+      <div class="tabs" id="tabs"></div>
+      <div class="bar">
+        <button class="nav" id="back" title="Back">&#8592;</button>
+        <button class="nav" id="forward" title="Forward">&#8594;</button>
+        <button class="nav" id="reload" title="Reload">&#8635;</button>
+        <button class="nav" id="home" title="Home">&#8962;</button>
+        <form id="navform">
+          <input
+            id="address"
+            type="text"
+            placeholder="Search or enter address"
+            autocomplete="off"
+            autocapitalize="off"
+            spellcheck="false"
+          />
+        </form>
+        <span class="shield" title="Capture-protected — this window is hidden from screenshots and screen recording">
+          <span class="dot"></span>
+        </span>
+      </div>
+    </div>
+
+    <script>
+      const { invoke } = window.__TAURI__.core;
+      const { listen } = window.__TAURI__.event;
+
+      const address = document.getElementById("address");
+      const tabsEl = document.getElementById("tabs");
+
+      document.getElementById("back").onclick = () => invoke("go_back");
+      document.getElementById("forward").onclick = () => invoke("go_forward");
+      document.getElementById("reload").onclick = () => invoke("reload");
+      document.getElementById("home").onclick = () => invoke("go_home");
+
+      document.getElementById("navform").addEventListener("submit", (e) => {
+        e.preventDefault();
+        const url = address.value.trim();
+        if (url) {
+          invoke("navigate", { url });
+          address.blur();
+        }
+      });
+
+      // ---- Tabs ----
+      function labelFor(url) {
+        try {
+          const h = new URL(url).hostname.replace(/^www\./, "");
+          return h || url;
+        } catch {
+          return url || "New Tab";
+        }
+      }
+      function renderTabs(list) {
+        tabsEl.innerHTML = "";
+        for (const t of list) {
+          const tab = document.createElement("div");
+          tab.className = "tab" + (t.active ? " active" : "");
+          tab.title = t.url;
+          tab.addEventListener("click", () => invoke("select_tab", { id: t.id }));
+
+          const label = document.createElement("span");
+          label.className = "label";
+          label.textContent = labelFor(t.url);
+          tab.appendChild(label);
+
+          const close = document.createElement("button");
+          close.className = "close";
+          close.textContent = "×";
+          close.title = "Close tab";
+          close.addEventListener("click", (e) => {
+            e.stopPropagation();
+            invoke("remove_tab", { id: t.id });
+          });
+          tab.appendChild(close);
+
+          tabsEl.appendChild(tab);
+        }
+        const plus = document.createElement("button");
+        plus.className = "newtab";
+        plus.textContent = "+";
+        plus.title = "New tab";
+        plus.addEventListener("click", () => invoke("new_tab", { url: null }));
+        tabsEl.appendChild(plus);
+      }
+      listen("tabs-changed", (event) => renderTabs(event.payload));
+
+      // The toolbar webview's rendered CSS height doesn't map cleanly from the
+      // physical size Rust sets on scaled/HiDPI displays. So we report our real
+      // innerHeight to Rust, which measures the ratio and resizes us to hit the
+      // target. A short loop converges (usually in one step).
+      const TOOLBAR_TARGET_CSS = 88;
+      let calibrating = false;
+      async function calibrate() {
+        if (calibrating) return;
+        calibrating = true;
+        try {
+          for (let i = 0; i < 4; i++) {
+            const h = window.innerHeight;
+            if (Math.abs(h - TOOLBAR_TARGET_CSS) <= 1) break;
+            await invoke("calibrate_toolbar", { measuredCssHeight: h });
+            await new Promise((r) => setTimeout(r, 90));
+          }
+        } catch (e) {
+          /* leave the toolbar at its best-effort size */
+        } finally {
+          calibrating = false;
+        }
+      }
+      window.addEventListener("load", () => {
+        setTimeout(async () => {
+          await calibrate();
+          // Fetch the current tabs once we're loaded (earlier events are missed).
+          invoke("request_tabs");
+        }, 50);
+      });
+      let resizeTimer;
+      window.addEventListener("resize", () => {
+        clearTimeout(resizeTimer);
+        resizeTimer = setTimeout(calibrate, 150);
+      });
+
+      // Address bar tracks the active tab's main-frame URL.
+      listen("url-changed", (event) => {
+        if (document.activeElement !== address) {
+          address.value = event.payload;
+        }
+      });
+
+      // Cmd/Ctrl+L: the native menu accelerator focuses this webview and emits
+      // "focus-address"; we then select all the text so the user can type over it.
+      listen("focus-address", () => {
+        address.focus();
+        address.select();
+      });
+
+      // Fallback for when the toolbar webview already holds keyboard focus.
+      window.addEventListener("keydown", (e) => {
+        if ((e.metaKey || e.ctrlKey) && (e.key === "l" || e.key === "L")) {
+          e.preventDefault();
+          address.focus();
+          address.select();
+        }
+      });
+    </script>
+  </body>
+</html>

@@ -1,0 +1,14 @@
+# Rust / Tauri
+/src-tauri/target
+/src-tauri/gen/schemas
+
+# Generated icons (regenerate with `npm run tauri icon app-icon.png`)
+# (kept in repo by default; uncomment to ignore)
+# /src-tauri/icons
+
+# Node
+node_modules
+npm-debug.log*
+
+# macOS
+.DS_Store

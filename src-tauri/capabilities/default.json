@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Permissions for the browser chrome (toolbar). Tab content webviews are created at runtime and use no Tauri APIs.",
+  "windows": ["main"],
+  "webviews": ["toolbar"],
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "core:webview:default",
+    "core:window:default"
+  ]
+}
