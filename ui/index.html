@@ -215,6 +215,7 @@
 
       // ---- Tabs ----
       function labelFor(url) {
+        if (!url || url === "about:blank") return "New Tab";
         try {
           const h = new URL(url).hostname.replace(/^www\./, "");
           return h || url;
@@ -283,6 +284,9 @@
           await calibrate();
           // Fetch the current tabs once we're loaded (earlier events are missed).
           invoke("request_tabs");
+          // The first tab opens blank, so focus the address bar to type into.
+          address.focus();
+          address.select();
         }, 50);
       });
       let resizeTimer;

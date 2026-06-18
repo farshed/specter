@@ -20,6 +20,23 @@ const HOME_URL: &str = "https://www.google.com";
 /// 0 until the first calibration completes.
 static TOOLBAR_PHYS_H: AtomicU32 = AtomicU32::new(0);
 
+/// Sequence for unique popup-window labels (window.open targets).
+static POPUP_SEQ: AtomicU32 = AtomicU32::new(0);
+
+/// Present as desktop Safari. Sites that gate on the user-agent — notably
+/// Google sign-in — otherwise reject the embedded WebKit view as an insecure
+/// browser, so the sign-in popup never proceeds.
+const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15";
+
+/// Title a popup sets (via the shim below) to ask the app to close it.
+const POPUP_CLOSE_SENTINEL: &str = "__specter_close__";
+/// Injected into popups: window.close() can't reach the OS window through wry,
+/// so route it through a document.title sentinel the app watches for.
+const POPUP_CLOSE_SHIM: &str = "(function(){var c=window.close.bind(window);\
+window.close=function(){try{document.title='__specter_close__';}catch(e){}\
+try{c();}catch(e){}};})();";
+
 // Menu item ids for keyboard accelerators.
 const FOCUS_ADDRESS_ID: &str = "focus_address";
 const NEW_TAB_ID: &str = "new_tab";
@@ -30,6 +47,9 @@ const CLOSE_WINDOW_ID: &str = "close_window";
 struct TabInfo {
     id: String,
     url: String,
+    /// True once the webview has committed a navigation. Until then its native
+    /// `URL` is nil and reading it would panic in wry, so we don't poll it.
+    loaded: bool,
 }
 
 /// All open tabs and which one is active. Managed as Tauri state.
@@ -149,8 +169,35 @@ fn emit_active_url(app: &AppHandle) {
 // Tab operations
 // ---------------------------------------------------------------------------
 
-/// Create a new content webview, make it the active tab, and lay everything out.
-fn open_tab(app: &AppHandle, url: String) -> Result<(), String> {
+/// What to show in the address bar / tab label for a loaded URL. A blank tab
+/// (about:blank) shows nothing so the address-bar placeholder is visible.
+fn display_url(url: &str) -> String {
+    if url == "about:blank" {
+        String::new()
+    } else {
+        url.to_string()
+    }
+}
+
+/// Focus the toolbar webview and tell it to select the address bar.
+fn focus_address_bar(app: &AppHandle) {
+    if let Some(toolbar) = app.get_webview("toolbar") {
+        let _ = toolbar.set_focus();
+    }
+    let _ = app.emit_to("toolbar", "focus-address", ());
+}
+
+/// Open a fresh blank tab in the foreground and focus the address bar.
+fn open_blank_tab(app: &AppHandle) -> Result<(), String> {
+    open_tab(app, "about:blank".to_string(), true)?;
+    focus_address_bar(app);
+    Ok(())
+}
+
+/// Create a new content webview and lay everything out. When `activate` is
+/// true the new tab is brought to the foreground; otherwise it opens in the
+/// background and the current tab stays active (e.g. cmd-click).
+fn open_tab(app: &AppHandle, url: String, activate: bool) -> Result<(), String> {
     let win = app.get_window("main").ok_or("no main window")?;
     let target = if url.trim().is_empty() {
         HOME_URL.to_string()
@@ -166,9 +213,12 @@ fn open_tab(app: &AppHandle, url: String) -> Result<(), String> {
         let id = format!("tab-{}", st.next);
         st.tabs.push(TabInfo {
             id: id.clone(),
-            url: target.clone(),
+            url: display_url(&target),
+            loaded: false,
         });
-        st.active = Some(id.clone());
+        if activate {
+            st.active = Some(id.clone());
+        }
         id
     };
 
@@ -176,17 +226,20 @@ fn open_tab(app: &AppHandle, url: String) -> Result<(), String> {
     let inner = win.inner_size().map_err(|e| e.to_string())?;
 
     let app_h = app.clone();
+    let app_popup = app.clone();
     let label = id.clone();
-    let builder = WebviewBuilder::new(&id, WebviewUrl::External(parsed)).on_page_load(
-        move |_wv, payload| {
+    let builder = WebviewBuilder::new(&id, WebviewUrl::External(parsed))
+        .user_agent(USER_AGENT)
+        .on_page_load(move |_wv, payload| {
             // on_page_load fires for the MAIN frame only (not iframes), so this
             // never picks up embedded widgets like accounts.google.com.
-            let loaded = payload.url().to_string();
+            let loaded = display_url(&payload.url().to_string());
             {
                 let state = app_h.state::<Mutex<TabState>>();
                 let mut st = state.lock().unwrap();
                 if let Some(t) = st.tabs.iter_mut().find(|t| t.id == label) {
                     t.url = loaded.clone();
+                    t.loaded = true;
                 }
             }
             emit_tabs(&app_h);
@@ -198,19 +251,78 @@ fn open_tab(app: &AppHandle, url: String) -> Result<(), String> {
             if is_active {
                 let _ = app_h.emit_to("toolbar", "url-changed", loaded);
             }
-        },
-    );
+        })
+        // Handle window.open / target="_blank" / cmd-click.
+        .on_new_window(move |url, features| {
+            // No requested geometry => a plain "open in new context" (cmd-click,
+            // target="_blank"). Browsers open these as a new TAB, so we do too.
+            if features.size().is_none() {
+                let app_tab = app_popup.clone();
+                let target = url.to_string();
+                // Defer to the next loop tick to avoid re-entering the event
+                // loop from inside this callback. Open in the background so the
+                // current tab stays focused (cmd-click behavior).
+                let _ = app_popup.run_on_main_thread(move || {
+                    let _ = open_tab(&app_tab, target, false);
+                });
+                return tauri::webview::NewWindowResponse::Deny;
+            }
 
+            // A sized window.open (e.g. "Sign in with Google" OAuth popup): open
+            // a real window that SHARES the opener's webview config so
+            // window.opener.postMessage — how OAuth returns its result — works.
+            let seq = POPUP_SEQ.fetch_add(1, Ordering::Relaxed);
+            let popup = tauri::WebviewWindowBuilder::new(
+                &app_popup,
+                format!("popup-{seq}"),
+                WebviewUrl::External("about:blank".parse().unwrap()),
+            )
+            // Default size; window_features() overrides it if the opener
+            // requested specific dimensions.
+            .inner_size(480.0, 640.0)
+            .window_features(features)
+            .user_agent(USER_AGENT)
+            .title(url.as_str())
+            // wry doesn't bridge JS window.close() to closing the OS window, so
+            // OAuth popups would linger blank after finishing. Flag the close via
+            // a title sentinel (observed below) and actually close the window.
+            .initialization_script(POPUP_CLOSE_SHIM)
+            .on_document_title_changed(|w, title| {
+                if title == POPUP_CLOSE_SENTINEL {
+                    let _ = w.close();
+                } else {
+                    let _ = w.set_title(&title);
+                }
+            });
+            match popup.build() {
+                Ok(window) => {
+                    // Keep the OAuth window capture-protected too.
+                    let _ = window.set_content_protected(true);
+                    tauri::webview::NewWindowResponse::Create { window }
+                }
+                Err(_) => tauri::webview::NewWindowResponse::Deny,
+            }
+        });
+
+    // Place foreground tabs in the content area; background tabs start parked
+    // off-screen so they don't flash over the current tab (relayout confirms it).
+    let position = if activate {
+        PhysicalPosition::new(0, toolbar_h as i32)
+    } else {
+        PhysicalPosition::new(inner.width as i32, toolbar_h as i32)
+    };
     win.add_child(
         builder,
-        PhysicalPosition::new(0, toolbar_h as i32),
+        position,
         PhysicalSize::new(inner.width, inner.height.saturating_sub(toolbar_h).max(1)),
     )
     .map_err(|e| e.to_string())?;
 
     relayout(&win);
     emit_tabs(app);
-    emit_active_url(app);
+    if activate {
+        emit_active_url(app);
+    }
     Ok(())
 }
 
@@ -253,8 +365,8 @@ fn close_tab(app: &AppHandle, id: &str) -> Result<(), String> {
     };
 
     if became_empty {
-        // Never leave the browser with zero tabs.
-        return open_tab(app, HOME_URL.to_string());
+        // Never leave the browser with zero tabs; open a fresh blank one.
+        return open_blank_tab(app);
     }
 
     relayout(&win);
@@ -321,7 +433,10 @@ fn go_home(app: AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 fn new_tab(app: AppHandle, url: Option<String>) -> Result<(), String> {
-    open_tab(&app, url.unwrap_or_default())
+    match url {
+        Some(u) if !u.trim().is_empty() => open_tab(&app, u, true),
+        _ => open_blank_tab(&app),
+    }
 }
 
 #[tauri::command]
@@ -384,7 +499,7 @@ fn main() {
                 }
                 let _ = app.emit_to("toolbar", "focus-address", ());
             } else if id == NEW_TAB_ID {
-                let _ = open_tab(app, String::new());
+                let _ = open_blank_tab(app);
             } else if id == CLOSE_TAB_ID {
                 let active = app.state::<Mutex<TabState>>().lock().unwrap().active.clone();
                 if let Some(a) = active {
@@ -501,7 +616,7 @@ fn main() {
             )?;
 
             // Open the first tab.
-            open_tab(app.handle(), HOME_URL.to_string())?;
+            open_blank_tab(app.handle())?;
 
             // Re-lay out on resize (active tab fills, inactive parked).
             let win = window.clone();
@@ -520,14 +635,22 @@ fn main() {
                 let mut last = String::new();
                 loop {
                     std::thread::sleep(std::time::Duration::from_millis(300));
-                    let current = poll
-                        .get_window("main")
-                        .and_then(|win| {
-                            let active = poll.state::<Mutex<TabState>>().lock().unwrap().active.clone();
-                            active.and_then(|id| win.get_webview(&id))
+                    // Only the active tab, and only once it has committed a
+                    // navigation — reading url() before that panics inside wry.
+                    let active_loaded = {
+                        let state = poll.state::<Mutex<TabState>>();
+                        let st = state.lock().unwrap();
+                        st.active.as_ref().and_then(|a| {
+                            st.tabs
+                                .iter()
+                                .find(|t| &t.id == a && t.loaded)
+                                .map(|t| t.id.clone())
                         })
+                    };
+                    let current = active_loaded
+                        .and_then(|id| poll.get_window("main").and_then(|w| w.get_webview(&id)))
                         .and_then(|wv| wv.url().ok())
-                        .map(|u| u.to_string());
+                        .map(|u| display_url(&u.to_string()));
 
                     let Some(url) = current else { continue };
                     if url == last {

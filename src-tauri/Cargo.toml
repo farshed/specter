@@ -16,9 +16,10 @@ path = "src/main.rs"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-# `unstable` is required for multiple webviews inside a single window
-# (Window::add_child, Manager::get_webview).
-tauri = { version = "2", features = ["unstable"] }
+# `unstable`         -> multiple webviews in one window (add_child, get_webview)
+# `macos-private-api` -> enables WebKit's `fullScreenEnabled` so the HTML5
+#                        Fullscreen API (fullscreen video) works.
+tauri = { version = "2", features = ["unstable", "macos-private-api"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
