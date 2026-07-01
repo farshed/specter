@@ -1,13 +1,15 @@
 // Prevents an extra console window on Windows in release builds.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::ffi::OsString;
+use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicU32, Ordering},
     Mutex,
 };
 use tauri::{
-    menu::{Menu, MenuItem, PredefinedMenuItem, Submenu},
-    webview::{Webview, WebviewBuilder},
+    menu::{IsMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu},
+    webview::{DownloadEvent, PageLoadEvent, Webview, WebviewBuilder},
     AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, WebviewUrl, Window, WindowEvent,
 };
 
@@ -29,6 +31,11 @@ static POPUP_SEQ: AtomicU32 = AtomicU32::new(0);
 const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
 AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15";
 
+/// Pause and detach every audio/video element so playback stops immediately
+/// when a tab is closed (before the webview is torn down).
+const STOP_MEDIA_JS: &str = "document.querySelectorAll('audio,video')\
+.forEach(function(m){try{m.pause();m.muted=true;m.removeAttribute('src');m.load();}catch(e){}});";
+
 /// Title a popup sets (via the shim below) to ask the app to close it.
 const POPUP_CLOSE_SENTINEL: &str = "__specter_close__";
 /// Injected into popups: window.close() can't reach the OS window through wry,
@@ -36,6 +43,45 @@ const POPUP_CLOSE_SENTINEL: &str = "__specter_close__";
 const POPUP_CLOSE_SHIM: &str = "(function(){var c=window.close.bind(window);\
 window.close=function(){try{document.title='__specter_close__';}catch(e){}\
 try{c();}catch(e){}};})();";
+
+/// Custom URL scheme the context-menu script uses to hand a download URL to the
+/// app (WebKit's native context-menu downloads never reach wry's handler).
+const DOWNLOAD_SCHEME: &str = "x-specter-dl";
+
+/// Injected into pages: a lightweight right-click menu for images and links
+/// (only — the native menu still appears elsewhere) that can open in a new tab,
+/// copy the address, and download. "Download" navigates to DOWNLOAD_SCHEME,
+/// which Rust intercepts and fetches; data:/blob: use a normal <a download>.
+const CONTEXT_MENU_JS: &str = r#"(function(){
+  if (window.top !== window.self) return;
+  function fileName(u){try{var p=new URL(u,location.href).pathname.split('/').filter(Boolean).pop();return decodeURIComponent(p||'')||'download';}catch(e){return 'download';}}
+  function download(url,name){
+    if(/^(data:|blob:)/i.test(url)){var a=document.createElement('a');a.href=url;a.download=name||'';document.body.appendChild(a);a.click();a.remove();return;}
+    var abs;try{abs=new URL(url,location.href).href;}catch(e){abs=url;}
+    location.href='x-specter-dl:?u='+encodeURIComponent(abs)+'&n='+encodeURIComponent(name||'')+'&r='+encodeURIComponent(location.href);
+  }
+  function copy(t){if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(t).catch(function(){fb(t);});}else fb(t);}
+  function fb(t){var x=document.createElement('textarea');x.value=t;x.style.cssText='position:fixed;opacity:0';document.body.appendChild(x);x.select();try{document.execCommand('copy');}catch(e){}x.remove();}
+  var menu=null;
+  function close(){if(menu){menu.remove();menu=null;document.removeEventListener('mousedown',od,true);window.removeEventListener('scroll',close,true);window.removeEventListener('blur',close);document.removeEventListener('keydown',ok,true);}}
+  function od(e){if(menu&&!menu.contains(e.target))close();}
+  function ok(e){if(e.key==='Escape')close();}
+  function item(label,fn){var i=document.createElement('div');i.textContent=label;i.style.cssText='padding:7px 14px;font:13px -apple-system,system-ui,sans-serif;color:#e8eaed;cursor:default;white-space:nowrap;border-radius:5px';i.onmouseenter=function(){i.style.background='#3a6fd8';};i.onmouseleave=function(){i.style.background='';};i.addEventListener('mousedown',function(e){e.preventDefault();});i.addEventListener('click',function(e){e.preventDefault();close();fn();});menu.appendChild(i);}
+  document.addEventListener('contextmenu',function(e){
+    var img=e.target.closest&&e.target.closest('img');
+    var link=e.target.closest&&e.target.closest('a[href]');
+    if(!img&&!link)return;
+    e.preventDefault();close();
+    menu=document.createElement('div');
+    menu.style.cssText='position:fixed;z-index:2147483647;min-width:180px;padding:5px;background:#26282d;border:1px solid #3a3d44;border-radius:9px;box-shadow:0 8px 28px rgba(0,0,0,.5)';
+    if(img){var s=img.currentSrc||img.src;item('Open image in new tab',function(){window.open(s,'_blank');});item('Copy image address',function(){copy(s);});item('Download image',function(){download(s,fileName(s));});}
+    if(link){if(img){var d=document.createElement('div');d.style.cssText='height:1px;margin:4px 6px;background:#3a3d44';menu.appendChild(d);}var h=link.href;item('Open link in new tab',function(){window.open(h,'_blank');});item('Copy link address',function(){copy(h);});item('Download linked file',function(){download(h,fileName(h));});}
+    document.body.appendChild(menu);
+    var r=menu.getBoundingClientRect(),x=Math.min(e.clientX,innerWidth-r.width-6),y=Math.min(e.clientY,innerHeight-r.height-6);
+    menu.style.left=Math.max(6,x)+'px';menu.style.top=Math.max(6,y)+'px';
+    document.addEventListener('mousedown',od,true);window.addEventListener('scroll',close,true);window.addEventListener('blur',close);document.addEventListener('keydown',ok,true);
+  },true);
+})();"#;
 
 // Menu item ids for keyboard accelerators.
 const FOCUS_ADDRESS_ID: &str = "focus_address";
@@ -47,9 +93,13 @@ const CLOSE_WINDOW_ID: &str = "close_window";
 struct TabInfo {
     id: String,
     url: String,
+    /// The page's document title (empty until the page reports one).
+    title: String,
     /// True once the webview has committed a navigation. Until then its native
     /// `URL` is nil and reading it would panic in wry, so we don't poll it.
     loaded: bool,
+    /// True while a navigation is in flight (drives the tab's loading spinner).
+    loading: bool,
 }
 
 /// All open tabs and which one is active. Managed as Tauri state.
@@ -58,6 +108,74 @@ struct TabState {
     tabs: Vec<TabInfo>,
     active: Option<String>,
     next: u32,
+}
+
+/// The user's Downloads folder (falling back to home, then the temp dir).
+fn downloads_dir() -> PathBuf {
+    if let Some(home) = std::env::var_os("HOME") {
+        let downloads = PathBuf::from(&home).join("Downloads");
+        if downloads.is_dir() {
+            return downloads;
+        }
+        return PathBuf::from(home);
+    }
+    std::env::temp_dir()
+}
+
+/// Avoid clobbering an existing file: `name.ext` -> `name (1).ext`, etc.
+fn unique_path(path: PathBuf) -> PathBuf {
+    if !path.exists() {
+        return path;
+    }
+    let dir = path.parent().map(PathBuf::from).unwrap_or_default();
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "download".into());
+    let ext = path.extension().map(|e| e.to_string_lossy().into_owned());
+    for n in 1..1000 {
+        let name = match &ext {
+            Some(e) => format!("{stem} ({n}).{e}"),
+            None => format!("{stem} ({n})"),
+        };
+        let candidate = dir.join(name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    path
+}
+
+/// Download `url` to ~/Downloads via curl, reporting start/finish to the
+/// toolbar. Used for context-menu downloads, which never reach the WKWebView
+/// download delegate. `referer` helps with hotlink-protected resources.
+fn start_download(app: &AppHandle, url: String, name: String, referer: String) {
+    let filename = if name.trim().is_empty() {
+        "download".to_string()
+    } else {
+        name
+    };
+    let path = unique_path(downloads_dir().join(filename));
+    let display = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "download".into());
+    let _ = app.emit_to("toolbar", "download-started", display);
+
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let mut cmd = std::process::Command::new("curl");
+        cmd.args(["-fL", "-sS", "--max-time", "600", "-A", USER_AGENT]);
+        if !referer.is_empty() {
+            cmd.arg("-e").arg(&referer);
+        }
+        let status = cmd.arg("-o").arg(&path).arg(&url).status();
+        let ok = matches!(status, Ok(s) if s.success());
+        if !ok {
+            let _ = std::fs::remove_file(&path);
+        }
+        let _ = app.emit_to("toolbar", "download-finished", ok);
+    });
 }
 
 /// Turn whatever the user typed in the address bar into a navigable URL.
@@ -142,6 +260,8 @@ fn emit_tabs(app: &AppHandle) {
             serde_json::json!({
                 "id": t.id,
                 "url": t.url,
+                "title": t.title,
+                "loading": t.loading,
                 "active": st.active.as_deref() == Some(t.id.as_str()),
             })
         })
@@ -168,6 +288,24 @@ fn emit_active_url(app: &AppHandle) {
 // ---------------------------------------------------------------------------
 // Tab operations
 // ---------------------------------------------------------------------------
+
+/// Enable Safari-style trackpad pinch zoom on a tab. WKWebView's
+/// `allowsMagnification` controls this but neither Tauri nor wry expose it, so
+/// flip it natively on the underlying WKWebView.
+#[cfg(target_os = "macos")]
+#[allow(unexpected_cfgs)] // objc 0.2's msg_send! macro emits a stray cfg check
+fn enable_magnification(webview: &Webview) {
+    use objc::runtime::{Object, YES};
+    use objc::{msg_send, sel, sel_impl};
+    let _ = webview.with_webview(|platform| {
+        let wk = platform.inner() as *mut Object;
+        if !wk.is_null() {
+            unsafe {
+                let _: () = msg_send![wk, setAllowsMagnification: YES];
+            }
+        }
+    });
+}
 
 /// What to show in the address bar / tab label for a loaded URL. A blank tab
 /// (about:blank) shows nothing so the address-bar placeholder is visible.
@@ -214,7 +352,10 @@ fn open_tab(app: &AppHandle, url: String, activate: bool) -> Result<(), String> 
         st.tabs.push(TabInfo {
             id: id.clone(),
             url: display_url(&target),
+            title: String::new(),
             loaded: false,
+            // Real URLs start loading immediately; a blank tab does not.
+            loading: target != "about:blank",
         });
         if activate {
             st.active = Some(id.clone());
@@ -226,20 +367,87 @@ fn open_tab(app: &AppHandle, url: String, activate: bool) -> Result<(), String> 
     let inner = win.inner_size().map_err(|e| e.to_string())?;
 
     let app_h = app.clone();
+    let app_title = app.clone();
     let app_popup = app.clone();
+    let app_dl = app.clone();
+    let app_nav = app.clone();
     let label = id.clone();
+    let label_title = id.clone();
     let builder = WebviewBuilder::new(&id, WebviewUrl::External(parsed))
         .user_agent(USER_AGENT)
+        // Custom right-click menu for images/links (download / open / copy).
+        .initialization_script(CONTEXT_MENU_JS)
+        // Intercept the download scheme that the context-menu script navigates
+        // to, and fetch the file ourselves (cancelling the navigation).
+        .on_navigation(move |url| {
+            if url.scheme() == DOWNLOAD_SCHEME {
+                let (mut u, mut n, mut r) = (String::new(), String::new(), String::new());
+                for (k, v) in url.query_pairs() {
+                    match &*k {
+                        "u" => u = v.into_owned(),
+                        "n" => n = v.into_owned(),
+                        "r" => r = v.into_owned(),
+                        _ => {}
+                    }
+                }
+                if !u.is_empty() {
+                    start_download(&app_nav, u, n, r);
+                }
+                return false; // don't actually navigate
+            }
+            true
+        })
+        // Let the page's own HTML5 drag-and-drop handle dropped files/images
+        // (e.g. upload zones) instead of Tauri intercepting the OS file drop.
+        .disable_drag_drop_handler()
+        // Save downloads to ~/Downloads (WKWebView won't download at all without
+        // a handler). De-duplicate the filename so nothing is overwritten. Emit
+        // start/finish events so the toolbar can show a downloads indicator.
+        .on_download(move |_wv, event| {
+            match event {
+                DownloadEvent::Requested { url, destination } => {
+                    let name = destination
+                        .file_name()
+                        .map(OsString::from)
+                        .filter(|n| !n.is_empty())
+                        .or_else(|| {
+                            url.path_segments()
+                                .and_then(|segs| segs.filter(|p| !p.is_empty()).last())
+                                .map(OsString::from)
+                        })
+                        .unwrap_or_else(|| OsString::from("download"));
+                    let path = unique_path(downloads_dir().join(name));
+                    let display = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "download".into());
+                    *destination = path;
+                    let _ = app_dl.emit_to("toolbar", "download-started", display);
+                }
+                DownloadEvent::Finished { success, .. } => {
+                    let _ = app_dl.emit_to("toolbar", "download-finished", success);
+                }
+                _ => {}
+            }
+            // Allow the download to proceed.
+            true
+        })
         .on_page_load(move |_wv, payload| {
             // on_page_load fires for the MAIN frame only (not iframes), so this
             // never picks up embedded widgets like accounts.google.com.
             let loaded = display_url(&payload.url().to_string());
+            let started = matches!(payload.event(), PageLoadEvent::Started);
             {
                 let state = app_h.state::<Mutex<TabState>>();
                 let mut st = state.lock().unwrap();
                 if let Some(t) = st.tabs.iter_mut().find(|t| t.id == label) {
                     t.url = loaded.clone();
                     t.loaded = true;
+                    t.loading = started;
+                    // A fresh navigation supersedes the old page's title.
+                    if started {
+                        t.title = String::new();
+                    }
                 }
             }
             emit_tabs(&app_h);
@@ -251,6 +459,18 @@ fn open_tab(app: &AppHandle, url: String, activate: bool) -> Result<(), String> 
             if is_active {
                 let _ = app_h.emit_to("toolbar", "url-changed", loaded);
             }
+        })
+        // Show the page's real title in its tab (fires on load and on SPA
+        // document.title changes).
+        .on_document_title_changed(move |_wv, title| {
+            {
+                let state = app_title.state::<Mutex<TabState>>();
+                let mut st = state.lock().unwrap();
+                if let Some(t) = st.tabs.iter_mut().find(|t| t.id == label_title) {
+                    t.title = title;
+                }
+            }
+            emit_tabs(&app_title);
         })
         // Handle window.open / target="_blank" / cmd-click.
         .on_new_window(move |url, features| {
@@ -311,12 +531,19 @@ fn open_tab(app: &AppHandle, url: String, activate: bool) -> Result<(), String> 
     } else {
         PhysicalPosition::new(inner.width as i32, toolbar_h as i32)
     };
-    win.add_child(
-        builder,
-        position,
-        PhysicalSize::new(inner.width, inner.height.saturating_sub(toolbar_h).max(1)),
-    )
-    .map_err(|e| e.to_string())?;
+    let webview = win
+        .add_child(
+            builder,
+            position,
+            PhysicalSize::new(inner.width, inner.height.saturating_sub(toolbar_h).max(1)),
+        )
+        .map_err(|e| e.to_string())?;
+
+    // Safari-style trackpad pinch zoom.
+    #[cfg(target_os = "macos")]
+    enable_magnification(&webview);
+    #[cfg(not(target_os = "macos"))]
+    let _ = &webview;
 
     relayout(&win);
     emit_tabs(app);
@@ -324,6 +551,18 @@ fn open_tab(app: &AppHandle, url: String, activate: bool) -> Result<(), String> 
         emit_active_url(app);
     }
     Ok(())
+}
+
+/// Switch to the tab at `index` in the tab strip (0-based). No-op if absent.
+fn select_tab_by_index(app: &AppHandle, index: usize) {
+    let id = {
+        let state = app.state::<Mutex<TabState>>();
+        let st = state.lock().unwrap();
+        st.tabs.get(index).map(|t| t.id.clone())
+    };
+    if let Some(id) = id {
+        let _ = switch_tab(app, &id);
+    }
 }
 
 fn switch_tab(app: &AppHandle, id: &str) -> Result<(), String> {
@@ -348,6 +587,13 @@ fn switch_tab(app: &AppHandle, id: &str) -> Result<(), String> {
 fn close_tab(app: &AppHandle, id: &str) -> Result<(), String> {
     let win = app.get_window("main").ok_or("no main window")?;
     if let Some(wv) = win.get_webview(id) {
+        // Closing a child webview doesn't reliably deallocate the WKWebView, so
+        // media would keep playing. Pause/clear media now, and navigate to
+        // about:blank to tear down the page (covering Web Audio too) first.
+        let _ = wv.eval(STOP_MEDIA_JS);
+        if let Ok(blank) = "about:blank".parse() {
+            let _ = wv.navigate(blank);
+        }
         let _ = wv.close();
     }
     let became_empty = {
@@ -408,6 +654,16 @@ fn navigate(app: AppHandle, url: String) -> Result<(), String> {
 fn go_back(app: AppHandle) -> Result<(), String> {
     active_webview(&app)?
         .eval("window.history.back()")
+        .map_err(|e| e.to_string())
+}
+
+/// Open the ~/Downloads folder in Finder.
+#[tauri::command]
+fn open_downloads() -> Result<(), String> {
+    std::process::Command::new("open")
+        .arg(downloads_dir())
+        .spawn()
+        .map(|_| ())
         .map_err(|e| e.to_string())
 }
 
@@ -487,6 +743,7 @@ fn main() {
             select_tab,
             remove_tab,
             request_tabs,
+            open_downloads,
             calibrate_toolbar
         ])
         // App-wide keyboard accelerators (work even while a content webview has
@@ -509,6 +766,11 @@ fn main() {
                 if let Some(win) = app.get_window("main") {
                     let _ = win.close();
                 }
+            } else if let Some(n) = id.strip_prefix("select_tab_") {
+                // Cmd+1..Cmd+9 -> switch to the Nth tab.
+                if let Ok(n) = n.parse::<usize>() {
+                    select_tab_by_index(app, n - 1);
+                }
             }
         })
         .setup(|app| {
@@ -518,7 +780,7 @@ fn main() {
             // items so Quit, copy/paste, minimize, etc. keep working.
             let app_menu = Submenu::with_items(
                 app,
-                "Specter",
+                "Chrome",
                 true,
                 &[
                     &PredefinedMenuItem::about(app, None, None)?,
@@ -574,6 +836,24 @@ fn main() {
                     &close_window_item,
                 ],
             )?;
+            // Cmd+1..Cmd+9 -> jump to the Nth tab.
+            let tab_number_items: Vec<MenuItem<_>> = (1..=9)
+                .map(|n| {
+                    MenuItem::with_id(
+                        app,
+                        format!("select_tab_{n}"),
+                        format!("Tab {n}"),
+                        true,
+                        Some(format!("CmdOrCtrl+{n}")),
+                    )
+                })
+                .collect::<Result<_, _>>()?;
+            let tab_number_refs: Vec<&dyn IsMenuItem<_>> = tab_number_items
+                .iter()
+                .map(|i| i as &dyn IsMenuItem<_>)
+                .collect();
+            let go_to_tab_menu = Submenu::with_items(app, "Go to Tab", true, &tab_number_refs)?;
+
             let window_menu = Submenu::with_items(
                 app,
                 "Window",
@@ -583,7 +863,16 @@ fn main() {
                     &PredefinedMenuItem::fullscreen(app, None)?,
                 ],
             )?;
-            let menu = Menu::with_items(app, &[&app_menu, &edit_menu, &tabs_menu, &window_menu])?;
+            let menu = Menu::with_items(
+                app,
+                &[
+                    &app_menu,
+                    &edit_menu,
+                    &tabs_menu,
+                    &go_to_tab_menu,
+                    &window_menu,
+                ],
+            )?;
             app.set_menu(menu)?;
 
             app.manage(Mutex::new(TabState::default()));
@@ -592,7 +881,7 @@ fn main() {
             let height = 800.0;
 
             let window = tauri::window::WindowBuilder::new(app, "main")
-                .title("Specter")
+                .title("Chrome")
                 .inner_size(width, height)
                 .min_inner_size(480.0, 360.0)
                 .build()?;
@@ -615,8 +904,19 @@ fn main() {
                 PhysicalSize::new(inner.width, toolbar_h),
             )?;
 
-            // Open the first tab.
-            open_blank_tab(app.handle())?;
+            // Open the first tab(s). URLs passed on the command line each open a
+            // tab (first one focused); with no args, a blank tab.
+            let cli_urls: Vec<String> = std::env::args()
+                .skip(1)
+                .filter(|a| !a.starts_with('-')) // skip flags / macOS -psn_ arg
+                .collect();
+            if cli_urls.is_empty() {
+                open_blank_tab(app.handle())?;
+            } else {
+                for (i, arg) in cli_urls.iter().enumerate() {
+                    open_tab(app.handle(), normalize_url(arg), i == 0)?;
+                }
+            }
 
             // Re-lay out on resize (active tab fills, inactive parked).
             let win = window.clone();

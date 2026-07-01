@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Specter toolbar</title>
+    <title>Chrome toolbar</title>
     <style>
       :root {
         --bg: #1d1f23;
@@ -68,6 +68,16 @@
         overflow: hidden;
         text-overflow: ellipsis;
       }
+      .tab .spinner {
+        flex: 0 0 auto;
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+        border: 2px solid var(--muted);
+        border-top-color: var(--accent);
+        animation: spin 0.7s linear infinite;
+      }
+      @keyframes spin { to { transform: rotate(360deg); } }
       .tab .close {
         all: unset;
         flex: 0 0 auto;
@@ -97,8 +107,77 @@
       }
       .newtab:hover { background: var(--field); color: var(--text); }
 
+      /* ---- Downloads ---- */
+      .download {
+        position: relative;
+        flex: 0 0 auto;
+        width: 32px;
+        height: 32px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: 8px;
+        color: var(--muted);
+        cursor: pointer;
+        font-size: 16px;
+      }
+      .download.hidden { display: none; }
+      .download:hover { background: var(--field); color: var(--text); }
+      .download.done { color: #38c172; }
+      .download .dspin {
+        display: none;
+        position: absolute;
+        width: 16px;
+        height: 16px;
+        border-radius: 50%;
+        border: 2px solid var(--border);
+        border-top-color: var(--accent);
+        animation: spin 0.7s linear infinite;
+      }
+      .download.active .dglyph { visibility: hidden; }
+      .download.active .dspin { display: block; }
+      .download .badge {
+        display: none;
+        position: absolute;
+        top: -1px;
+        right: -1px;
+        min-width: 14px;
+        height: 14px;
+        padding: 0 3px;
+        border-radius: 7px;
+        background: var(--accent);
+        color: #0b1220;
+        font-size: 9px;
+        font-weight: 600;
+        align-items: center;
+        justify-content: center;
+      }
+      .dltoast {
+        position: absolute;
+        right: 10px;
+        bottom: 7px;
+        max-width: 62%;
+        padding: 6px 10px;
+        border-radius: 8px;
+        background: var(--field-focus);
+        border: 1px solid var(--border);
+        color: var(--text);
+        font-size: 12px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        box-shadow: 0 4px 14px rgba(0, 0, 0, 0.4);
+        cursor: pointer;
+        opacity: 0;
+        transform: translateY(6px);
+        transition: opacity 0.15s ease, transform 0.15s ease;
+        pointer-events: none;
+      }
+      .dltoast.show { opacity: 1; transform: none; pointer-events: auto; }
+
       /* ---- Nav row ---- */
       .bar {
+        position: relative;
         flex: 1 1 auto;
         display: flex;
         align-items: center;
@@ -186,9 +265,15 @@
             spellcheck="false"
           />
         </form>
+        <button class="download hidden" id="downloads" title="Downloads — open folder">
+          <span class="dglyph">&#8595;</span>
+          <span class="dspin"></span>
+          <span class="badge"></span>
+        </button>
         <span class="shield" title="Capture-protected — this window is hidden from screenshots and screen recording">
           <span class="dot"></span>
         </span>
+        <div class="dltoast" id="dltoast" title="Open Downloads"></div>
       </div>
     </div>
 
@@ -203,6 +288,52 @@
       document.getElementById("forward").onclick = () => invoke("go_forward");
       document.getElementById("reload").onclick = () => invoke("reload");
       document.getElementById("home").onclick = () => invoke("go_home");
+
+      // ---- Downloads indicator ----
+      const dlBtn = document.getElementById("downloads");
+      const dlBadge = dlBtn.querySelector(".badge");
+      const dlToast = document.getElementById("dltoast");
+      let dlActive = 0; // in-flight downloads
+      let dlDone = 0; // completed this session
+      const dlNames = []; // filenames awaiting completion (FIFO)
+      let dlToastTimer;
+
+      dlBtn.addEventListener("click", () => invoke("open_downloads"));
+      dlToast.addEventListener("click", () => invoke("open_downloads"));
+
+      function refreshDownloads() {
+        dlBtn.classList.toggle("hidden", dlActive === 0 && dlDone === 0);
+        dlBtn.classList.toggle("active", dlActive > 0);
+        dlBtn.classList.toggle("done", dlActive === 0 && dlDone > 0);
+        dlBadge.style.display = dlDone > 0 ? "flex" : "none";
+        dlBadge.textContent = String(dlDone);
+        dlBtn.title = dlActive > 0
+          ? dlActive + " downloading…"
+          : "Downloads — open folder";
+      }
+      function showToast(text) {
+        dlToast.textContent = text;
+        dlToast.classList.add("show");
+        clearTimeout(dlToastTimer);
+        dlToastTimer = setTimeout(() => dlToast.classList.remove("show"), 3500);
+      }
+
+      listen("download-started", (e) => {
+        dlActive++;
+        dlNames.push(e.payload || "download");
+        refreshDownloads();
+      });
+      listen("download-finished", (e) => {
+        if (dlActive > 0) dlActive--;
+        const name = dlNames.shift() || "download";
+        if (e.payload) {
+          dlDone++;
+          showToast("↓  " + name);
+        } else {
+          showToast("✕  Download failed");
+        }
+        refreshDownloads();
+      });
 
       document.getElementById("navform").addEventListener("submit", (e) => {
         e.preventDefault();
@@ -223,6 +354,9 @@
           return url || "New Tab";
         }
       }
+      function titleFor(t) {
+        return (t.title && t.title.trim()) || labelFor(t.url);
+      }
       function renderTabs(list) {
         tabsEl.innerHTML = "";
         for (const t of list) {
@@ -231,9 +365,15 @@
           tab.title = t.url;
           tab.addEventListener("click", () => invoke("select_tab", { id: t.id }));
 
+          if (t.loading) {
+            const spinner = document.createElement("span");
+            spinner.className = "spinner";
+            tab.appendChild(spinner);
+          }
+
           const label = document.createElement("span");
           label.className = "label";
-          label.textContent = labelFor(t.url);
+          label.textContent = titleFor(t);
           tab.appendChild(label);
 
           const close = document.createElement("button");
@@ -284,9 +424,14 @@
           await calibrate();
           // Fetch the current tabs once we're loaded (earlier events are missed).
           invoke("request_tabs");
-          // The first tab opens blank, so focus the address bar to type into.
-          address.focus();
-          address.select();
+          // If the startup tab is blank (no URL arg), focus the address bar to
+          // type into. If launched with a URL, leave the bar showing that URL.
+          setTimeout(() => {
+            if (!address.value) {
+              address.focus();
+              address.select();
+            }
+          }, 60);
         }, 50);
       });
       let resizeTimer;

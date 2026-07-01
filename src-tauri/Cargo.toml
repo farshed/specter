@@ -5,11 +5,10 @@ description = "A basic, screenshot-protected internet browser built with Tauri"
 edition = "2021"
 rust-version = "1.77.2"
 
-# Capitalize the binary so the macOS app-menu name reads "Specter" in dev too
-# (the crate name stays lowercase per convention; `tauri build` already names
-# the bundle from productName).
+# The binary name is what the macOS app-menu shows in dev, so it carries the
+# user-facing product name (the crate/package stays "specter").
 [[bin]]
-name = "Specter"
+name = "Chrome"
 path = "src/main.rs"
 
 [build-dependencies]
@@ -22,6 +21,11 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = ["unstable", "macos-private-api"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# Used to flip WKWebView.allowsMagnification (trackpad pinch zoom), which
+# neither Tauri nor wry expose.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc = "0.2"
 
 [profile.release]
 codegen-units = 1
