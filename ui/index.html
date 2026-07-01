@@ -109,6 +109,7 @@
 
       /* ---- Downloads ---- */
       .download {
+        all: unset;
         position: relative;
         flex: 0 0 auto;
         width: 32px;
@@ -226,25 +227,6 @@
         background: var(--field-focus);
       }
       input::placeholder { color: var(--muted); }
-      .shield {
-        flex: 0 0 auto;
-        margin-left: 2px;
-        width: 32px;
-        height: 32px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        border-radius: 8px;
-        color: #38c172;
-        cursor: default;
-      }
-      .shield .dot {
-        width: 8px;
-        height: 8px;
-        border-radius: 50%;
-        background: #38c172;
-        box-shadow: 0 0 6px #38c172aa;
-      }
     </style>
   </head>
   <body>
@@ -270,9 +252,6 @@
           <span class="dspin"></span>
           <span class="badge"></span>
         </button>
-        <span class="shield" title="Capture-protected — this window is hidden from screenshots and screen recording">
-          <span class="dot"></span>
-        </span>
         <div class="dltoast" id="dltoast" title="Open Downloads"></div>
       </div>
     </div>
