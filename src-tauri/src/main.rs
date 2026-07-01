@@ -110,6 +110,50 @@ struct TabState {
     next: u32,
 }
 
+/// Scheme for our internal "view a local file" protocol (file:// and top-level
+/// data: are both restricted by WebKit, so we serve dropped files ourselves).
+const LOCAL_FILE_SCHEME: &str = "specterfile";
+
+/// MIME type for a file the webview can display, or None if it can't (in which
+/// case a dropped file of this type is ignored).
+fn viewable_mime(path: &std::path::Path) -> Option<&'static str> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    Some(match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "svg" => "image/svg+xml",
+        "avif" => "image/avif",
+        "ico" => "image/x-icon",
+        "pdf" => "application/pdf",
+        "txt" | "text" | "log" | "md" | "markdown" => "text/plain; charset=utf-8",
+        "json" => "application/json; charset=utf-8",
+        "xml" => "application/xml; charset=utf-8",
+        "csv" => "text/csv; charset=utf-8",
+        "html" | "htm" => "text/html; charset=utf-8",
+        "mp4" | "m4v" => "video/mp4",
+        "webm" => "video/webm",
+        "mov" => "video/quicktime",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "ogg" => "audio/ogg",
+        "m4a" => "audio/mp4",
+        "flac" => "audio/flac",
+        _ => return None,
+    })
+}
+
+/// Build a `specterfile://localhost/?p=<path>` URL that serves the given file.
+fn local_file_url(path: &std::path::Path) -> String {
+    let mut url = tauri::Url::parse(&format!("{LOCAL_FILE_SCHEME}://localhost/"))
+        .expect("valid base url");
+    url.query_pairs_mut()
+        .append_pair("p", &path.to_string_lossy());
+    url.to_string()
+}
+
 /// The user's Downloads folder (falling back to home, then the temp dir).
 fn downloads_dir() -> PathBuf {
     if let Some(home) = std::env::var_os("HOME") {
@@ -311,10 +355,18 @@ fn enable_magnification(webview: &Webview) {
 /// (about:blank) shows nothing so the address-bar placeholder is visible.
 fn display_url(url: &str) -> String {
     if url == "about:blank" {
-        String::new()
-    } else {
-        url.to_string()
+        return String::new();
     }
+    // For a local-file tab, show the file's path instead of the internal URL.
+    if url.starts_with(&format!("{LOCAL_FILE_SCHEME}://")) {
+        if let Ok(parsed) = tauri::Url::parse(url) {
+            if let Some((_, p)) = parsed.query_pairs().find(|(k, _)| k == "p") {
+                return p.into_owned();
+            }
+        }
+        return String::new();
+    }
+    url.to_string()
 }
 
 /// Focus the toolbar webview and tell it to select the address bar.
@@ -394,6 +446,22 @@ fn open_tab(app: &AppHandle, url: String, activate: bool) -> Result<(), String> 
                     start_download(&app_nav, u, n, r);
                 }
                 return false; // don't actually navigate
+            }
+            // A file:// navigation means a file was dropped onto the page (with
+            // no picker to catch it) and WebKit is opening it. Open supported
+            // types in a NEW tab via our protocol; ignore the current tab and
+            // anything we can't display.
+            if url.scheme() == "file" {
+                if let Ok(path) = url.to_file_path() {
+                    if viewable_mime(&path).is_some() {
+                        let app_file = app_nav.clone();
+                        let tab_url = local_file_url(&path);
+                        let _ = app_nav.run_on_main_thread(move || {
+                            let _ = open_tab(&app_file, tab_url, true);
+                        });
+                    }
+                }
+                return false; // never open file:// in the current tab
             }
             true
         })
@@ -733,6 +801,33 @@ fn calibrate_toolbar(app: AppHandle, measured_css_height: f64) -> Result<(), Str
 
 fn main() {
     tauri::Builder::default()
+        // Serve local files dropped onto the browser (file:// and top-level
+        // data: are blocked by WebKit, so we stream the bytes ourselves).
+        .register_uri_scheme_protocol(LOCAL_FILE_SCHEME, |_ctx, request| {
+            use tauri::http::Response;
+            let path = tauri::Url::parse(&request.uri().to_string())
+                .ok()
+                .and_then(|u| {
+                    u.query_pairs()
+                        .find(|(k, _)| k == "p")
+                        .map(|(_, v)| PathBuf::from(v.into_owned()))
+                });
+            match path {
+                Some(p) => {
+                    let mime = viewable_mime(&p).unwrap_or("application/octet-stream");
+                    match std::fs::read(&p) {
+                        Ok(bytes) => Response::builder()
+                            .status(200)
+                            .header("Content-Type", mime)
+                            .header("Access-Control-Allow-Origin", "*")
+                            .body(bytes)
+                            .unwrap(),
+                        Err(_) => Response::builder().status(404).body(Vec::new()).unwrap(),
+                    }
+                }
+                None => Response::builder().status(400).body(Vec::new()).unwrap(),
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             navigate,
             go_back,

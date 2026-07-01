@@ -326,6 +326,10 @@
       // ---- Tabs ----
       function labelFor(url) {
         if (!url || url === "about:blank") return "New Tab";
+        // Local file tab (address bar shows the full path) -> label with filename.
+        if (url[0] === "/") {
+          return url.split("/").filter(Boolean).pop() || url;
+        }
         try {
           const h = new URL(url).hostname.replace(/^www\./, "");
           return h || url;
