@@ -8,7 +8,7 @@ rust-version = "1.77.2"
 # The binary name is what the macOS app-menu shows in dev, so it carries the
 # user-facing product name (the crate/package stays "specter").
 [[bin]]
-name = "Chrome"
+name = "Specter"
 path = "src/main.rs"
 
 [build-dependencies]

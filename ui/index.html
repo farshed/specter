@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Chrome toolbar</title>
+    <title>Specter toolbar</title>
     <style>
       :root {
         --bg: #1d1f23;
@@ -236,7 +236,6 @@
         <button class="nav" id="back" title="Back">&#8592;</button>
         <button class="nav" id="forward" title="Forward">&#8594;</button>
         <button class="nav" id="reload" title="Reload">&#8635;</button>
-        <button class="nav" id="home" title="Home">&#8962;</button>
         <form id="navform">
           <input
             id="address"
@@ -266,7 +265,6 @@
       document.getElementById("back").onclick = () => invoke("go_back");
       document.getElementById("forward").onclick = () => invoke("go_forward");
       document.getElementById("reload").onclick = () => invoke("reload");
-      document.getElementById("home").onclick = () => invoke("go_home");
 
       // ---- Downloads indicator ----
       const dlBtn = document.getElementById("downloads");
@@ -314,12 +312,202 @@
         refreshDownloads();
       });
 
+      // ---- Address autocomplete history ----
+      const HISTORY_KEY = "specter.visitHistory.v1";
+      const HISTORY_LIMIT = 600;
+      const TOOLBAR_TARGET_CSS = 88;
+      let visitHistory = loadHistory();
+      let inlineCompletion = null;
+      let acceptedCompletion = null;
+      let completingInline = false;
+
+      function loadHistory() {
+        try {
+          const parsed = JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]");
+          return Array.isArray(parsed) ? parsed.filter((item) => item && item.url) : [];
+        } catch {
+          return [];
+        }
+      }
+      function saveHistory() {
+        localStorage.setItem(HISTORY_KEY, JSON.stringify(visitHistory.slice(0, HISTORY_LIMIT)));
+      }
+      function canRemember(url) {
+        return Boolean(url && url !== "about:blank" && !/^data:/i.test(url));
+      }
+      function displayTitleForHistory(url, title) {
+        const cleanTitle = (title || "").trim();
+        if (cleanTitle && cleanTitle !== url) return cleanTitle;
+        return labelFor(url);
+      }
+      function hostFor(url) {
+        if (url && url[0] === "/") return "";
+        try {
+          return new URL(url).hostname.replace(/^www\./, "");
+        } catch {
+          return "";
+        }
+      }
+      function completionTextFor(item, query) {
+        const url = item.url || "";
+        const host = item.host || "";
+        const title = item.title || "";
+        const lowerQuery = query.toLowerCase();
+        if (url.toLowerCase().startsWith(lowerQuery)) {
+          try {
+            const parsed = new URL(url);
+            if (parsed.pathname === "/" && !parsed.search && !parsed.hash) {
+              return parsed.origin;
+            }
+          } catch {
+            /* keep the original URL */
+          }
+          return url;
+        }
+        if (host.toLowerCase().startsWith(lowerQuery)) {
+          try {
+            const parsed = new URL(url);
+            const path = parsed.pathname === "/" ? "" : parsed.pathname;
+            return host + path + parsed.search + parsed.hash;
+          } catch {
+            return host || url;
+          }
+        }
+        if (title.toLowerCase().startsWith(lowerQuery)) return title;
+        return "";
+      }
+      function rememberVisit(url, title, countVisit = true) {
+        if (!canRemember(url)) return;
+        const now = Date.now();
+        const existing = visitHistory.find((item) => item.url === url);
+        if (existing) {
+          existing.title = displayTitleForHistory(url, title || existing.title);
+          existing.host = hostFor(url);
+          if (countVisit) {
+            existing.lastVisited = now;
+            existing.visits = (existing.visits || 0) + 1;
+          }
+        } else {
+          visitHistory.unshift({
+            url,
+            title: displayTitleForHistory(url, title),
+            host: hostFor(url),
+            lastVisited: now,
+            visits: 1,
+          });
+        }
+        visitHistory.sort((a, b) => (b.lastVisited || 0) - (a.lastVisited || 0));
+        if (visitHistory.length > HISTORY_LIMIT) visitHistory.length = HISTORY_LIMIT;
+        saveHistory();
+      }
+      function rememberTabs(list) {
+        for (const tab of list || []) {
+          rememberVisit(tab.url, tab.title, false);
+        }
+      }
+      function scoreHistoryItem(item, query) {
+        const url = (item.url || "").toLowerCase();
+        const title = (item.title || "").toLowerCase();
+        const host = (item.host || "").toLowerCase();
+        const completion = completionTextFor(item, query);
+        if (!completion) {
+          return -1;
+        }
+        let score = 0;
+        if (host.startsWith(query)) score += 110;
+        if (title.startsWith(query)) score += 95;
+        if (url.startsWith(query)) score += 80;
+        if (host.includes(query)) score += 45;
+        if (title.includes(query)) score += 35;
+        if (url.includes(query)) score += 25;
+        score += Math.min(item.visits || 1, 20) * 2;
+        score += Math.max(0, 30 - (Date.now() - (item.lastVisited || 0)) / 86400000);
+        return score;
+      }
+      function bestInlineMatch(query) {
+        const q = query.trim().toLowerCase();
+        if (!q) return null;
+        return visitHistory
+          .map((item) => ({
+            item,
+            score: scoreHistoryItem(item, q),
+            text: completionTextFor(item, q),
+          }))
+          .filter((entry) => entry.score >= 0)
+          .sort((a, b) => b.score - a.score)
+          [0] || null;
+      }
+      function clearInlineCompletion() {
+        inlineCompletion = null;
+      }
+      function applyInlineCompletion() {
+        if (completingInline || document.activeElement !== address) return;
+        if (address.selectionStart !== address.selectionEnd) return;
+
+        const typed = address.value;
+        const query = typed.trim();
+        clearInlineCompletion();
+        acceptedCompletion = null;
+        if (!query) return;
+
+        const match = bestInlineMatch(query);
+        if (!match || !match.text || match.text.toLowerCase() === query.toLowerCase()) {
+          return;
+        }
+        if (!match.text.toLowerCase().startsWith(query.toLowerCase())) return;
+
+        completingInline = true;
+        address.value = typed + match.text.slice(query.length);
+        address.setSelectionRange(typed.length, address.value.length);
+        inlineCompletion = {
+          text: match.text,
+          url: match.item.url,
+          typed,
+        };
+        completingInline = false;
+      }
+
       document.getElementById("navform").addEventListener("submit", (e) => {
         e.preventDefault();
-        const url = address.value.trim();
+        const hasInlineSelection = inlineCompletion
+          && address.selectionStart === inlineCompletion.typed.length
+          && address.selectionEnd === address.value.length
+          && address.value === inlineCompletion.text;
+        const hasAcceptedCompletion = acceptedCompletion
+          && address.value === acceptedCompletion.text;
+        const url = hasInlineSelection
+          ? inlineCompletion.url
+          : hasAcceptedCompletion
+            ? acceptedCompletion.url
+            : address.value.trim();
         if (url) {
+          clearInlineCompletion();
+          acceptedCompletion = null;
           invoke("navigate", { url });
           address.blur();
+        }
+      });
+      address.addEventListener("input", () => {
+        if (completingInline) return;
+        applyInlineCompletion();
+      });
+      address.addEventListener("keydown", (e) => {
+        if (e.key === "Tab" && inlineCompletion) {
+          e.preventDefault();
+          address.value = inlineCompletion.text;
+          address.setSelectionRange(address.value.length, address.value.length);
+          acceptedCompletion = {
+            text: inlineCompletion.text,
+            url: inlineCompletion.url,
+          };
+          clearInlineCompletion();
+        } else if (e.key === "Escape") {
+          clearInlineCompletion();
+          acceptedCompletion = null;
+          address.setSelectionRange(address.value.length, address.value.length);
+        } else if (e.key === "Backspace" || e.key === "Delete") {
+          clearInlineCompletion();
+          acceptedCompletion = null;
         }
       });
 
@@ -341,6 +529,7 @@
         return (t.title && t.title.trim()) || labelFor(t.url);
       }
       function renderTabs(list) {
+        rememberTabs(list);
         tabsEl.innerHTML = "";
         for (const t of list) {
           const tab = document.createElement("div");
@@ -384,7 +573,6 @@
       // physical size Rust sets on scaled/HiDPI displays. So we report our real
       // innerHeight to Rust, which measures the ratio and resizes us to hit the
       // target. A short loop converges (usually in one step).
-      const TOOLBAR_TARGET_CSS = 88;
       let calibrating = false;
       async function calibrate() {
         if (calibrating) return;
@@ -425,6 +613,7 @@
 
       // Address bar tracks the active tab's main-frame URL.
       listen("url-changed", (event) => {
+        rememberVisit(event.payload, "");
         if (document.activeElement !== address) {
           address.value = event.payload;
         }

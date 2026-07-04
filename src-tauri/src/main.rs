@@ -875,7 +875,7 @@ fn main() {
             // items so Quit, copy/paste, minimize, etc. keep working.
             let app_menu = Submenu::with_items(
                 app,
-                "Chrome",
+                "Specter",
                 true,
                 &[
                     &PredefinedMenuItem::about(app, None, None)?,
@@ -976,7 +976,7 @@ fn main() {
             let height = 800.0;
 
             let window = tauri::window::WindowBuilder::new(app, "main")
-                .title("Chrome")
+                .title("Specter")
                 .inner_size(width, height)
                 .min_inner_size(480.0, 360.0)
                 .build()?;
